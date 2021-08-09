@@ -27,8 +27,8 @@ from qgis.PyQt import QtGui
 from qgis.PyQt.QtWidgets import QAction, QDockWidget, QMessageBox, QTableWidgetItem, QLabel, QTableView, QPushButton, QHBoxLayout
 from qgis import processing
 from qgis.core import QgsTask, QgsApplication
+from qtrangeslider import QLabeledRangeSlider
 from qgis.utils import plugins
-
 from .resources import *
 from .sentinel_upscaling_dialog import SentinelUpscalingDialog
 from .sentinel_upscaling_dialog_search import SentinelUpscalingDialogSearch
@@ -36,30 +36,247 @@ import os.path
 from sentinelsat import SentinelAPI, read_geojson, geojson_to_wkt
 import requests
 import re
+from hurry.filesize import size
+import shutil
+import sys
 
-from zipfile import ZipFile
-from io import BytesIO
+import xml.etree.ElementTree as et
+
+import time
+
+# Css para estilizar a barra de intervalo de porcentagem nuvens
+QSS = """
+QSlider {
+    min-height: 10px;
+    max-height: 15px;
+    max-width:370px;
+    padding-bottom: 21px;
+}
+QSlider::groove:horizontal {
+    border: 0px solid #000;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #123, stop:1 #123);
+    height: 15px;
+    border-radius: 0px;
+}
+QSlider::handle {
+    background: qradialgradient(cx:0, cy:0, radius: 1.2, fx:0.35,
+                                fy:0.35, stop:0 #eef, stop:1 #eef);
+    height: 10px;
+    width: 10px;
+    border-radius: 0px;
+}
+QRangeSlider {
+    qproperty-barColor: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #cdf, stop:1 #cdf);
+}
+"""
+
+# Carrega as coordenadas do poligono da região do rio
+footprint = geojson_to_wkt(read_geojson(os.path.dirname(__file__) + "/map.geojson"))
+
+def faz_upscaling(task, projeto):
+    """ Realiza o upscaling da imagem passada por paramêtro
+
+    Parameters
+    ----------
+    task: QgsTask
+        É um paramêtro da classe QgsTask e é utilizado implicitamente pelo QGIS.
+    projeto: dict(str, str, str)
+        É um dicionário com todos os nomes dos arquivo, seja de entrada ou o nome base
+
+    Returns
+    -------
+    dict
+        Um dicionário com os nomes dos arquivos.
+    """
+
+    processing.run('gdal:warpreproject',
+                        {'INPUT':projeto[2],
+                        'RESAMPLING': 4,
+                        'TARGET_RESOLUTION': 2.5000,
+                        'MULTITHREADING': True,
+                        'OPTIONS': 'COMPRESS=JPEG|JPEG_QUALITY=100|NUM_THREADS=ALL_CPUS',
+                        'OUTPUT':projeto[0][:-4] + "_up.jpeg"})
+
+    return projeto
+
+def realiza_busca(task, produto, sess, tabela):
+    """ Realiza as inserções das linhas da tabela de produtos achados
+
+    Parameters
+    ----------
+    task: QgsTask
+        É um paramêtro da classe QgsTask e é utilizado implicitamente pelo QGIS.
+    produto: list(dict)
+        É uma lista com todos os produtos encontrados, sendo cada produto um dicionário com todas as informações sobre ele.
+    sess: request.Session
+        É uma sessão iniciada contendo os headers e as credenciais para acesso ao Sentinel.
+    tabela: QTableView
+        É uma variavel referente ao widget da tabela de produtos
+
+    Returns
+    -------
+    dict(list, list, list)
+        É um dicionario contendo listas de: dos arquivos para download (url, nome, caminho para diretorio); o nome dos produtos; os bytes de cada imagem para o preview 
+    """
+
+    def busca_TCI(root):
+        """ Busca dentro do xml passado, o nome do arquivo TCI
+
+        Parameters
+        ----------
+        root: xml.etree.ElementTree.et 
+            É o inicio do arquivo xml que passou pelo parse
+
+        Returns
+        -------
+        str
+            Uma string com o nome do arquivo TCI daquele produto.
+        """
+        for entry in root.iter('{http://www.w3.org/2005/Atom}entry'):
+            for titles in entry.iter('{http://www.w3.org/2005/Atom}title'):
+                # se o titulo do arquivo termina com TCI e é de 10m
+                if titles.text.endswith('_TCI_10m.jp2'):
+                    return titles.text
+
+    # inicializa as listas que serão retornadas
+    url_nome = []
+    lista_down = []
+    img = []
+    iid = 0
+
+    # para cada produto dentro da lista de produtos.
+    for chave, valor in produto.items():
+
+        # insere uma linha na tabela
+        tabela.insertRow(iid)
         
-def do_task(task, produto, api):
+        # adquire os bytes da imagem preview desse produto
+        byts = sess.get(valor["link_icon"]).content
+        img.append(byts)
 
-    dic = api.download(produto, os.path.dirname(__file__) + '/temp/')
-    return dic
+        # é feito uma tentativa para conseguir achar o TCI usando o caminho padrão de URL, alguns dos produtos ainda usam esse caminho
+        try:
+            # forma a url do caminho padrão
+            tci = valor['link'][:-6] + f"Nodes(\'{valor['title']}.SAFE\')/Nodes(\'GRANULE')/Nodes"
+            res = sess.get(tci).content
 
-def verifica(nome):
-    if "_10m" in nome and ("_B02" in nome or "_B03" in nome or "_B04" in nome or "_TCI_" in nome):
-        return True
-    return False
+            # realiza o parse do xml resultante
+            root = et.fromstring(res)
+            granule = root.find('./{http://www.w3.org/2005/Atom}entry/{http://www.w3.org/2005/Atom}title').text
 
-def stopped(self):
-    QgsMessageLog.logMessage(
-        'RandomTask "{name}" was canceled'.format(
-            name=self.description()),
-        MESSAGE_CATEGORY, Qgis.Info)
-    super().cancel()
+            # alguns produtos possuem esse caminho
+            try:
+                tci = tci + f"(\'{granule}\')/Nodes(\'IMG_DATA\')/Nodes(\'R10m\')/Nodes"
+
+                res = sess.get(tci).content
+                root = et.fromstring(res)
+            except:
+                # outros não possuem aquele caminho
+                tci = tci + f"(\'{granule}\')/Nodes(\'IMG_DATA\')/Nodes"
+        except:
+            # se o caminho original não funcionou, o caminho alternativo é utilizado
+            tci = valor['link'][:-6] + f"Nodes(\'{valor['title']}.SAFE\')/Nodes"
+
+        res = sess.get(tci).content
+        root = et.fromstring(res)
+
+        # busca o nome completo do arquivo TCI
+        titulo = busca_TCI(root)
+        
+        # guarda os nomes de arquivo do produto atual
+        tci = tci + f"('{titulo}')/$value"
+        url_nome.append({'url': tci, 'path': os.path.dirname(__file__) + f"/temp/{valor['title']}", 'img': titulo}) 
+
+        # busca o tamanho do arquivo do produto atual e cria a descrição da tabela 
+        header = sess.head(tci).headers
+        description = f"Titulo: {valor['title']}\nData: {valor['beginposition']}\n% de Nuvens: {valor['cloudcoverpercentage']}\nTamanho do Arquivo: {size(int(header['content-length']))}"
+
+        # insere as colunas da nova linha
+        tabela.setColumnWidth(0,366)
+        tabela.setColumnWidth(1,70)
+        tabela.setItem(iid, 0, QTableWidgetItem(description))
+        lista_down.append(chave)
+        
+        iid = iid + 1 
+    
+    return url_nome, lista_down, img
+
+def faz_download(task, produto, sess):
+    """ Realiza o download do produto escolhido pelo o usuário
+
+    Parameters
+    ----------
+    task: QgsTask
+        É um paramêtro da classe QgsTask e é utilizado implicitamente pelo QGIS.
+    produto: dict
+        É um dicionário com todas as informações sobre o produto escolhido.
+    sess: request.Session
+        É uma sessão iniciada contendo os headers e as credenciais para acesso ao Sentinel.
+
+    Returns
+    -------
+    dict
+        É um dicionario contendo as informações do produto baixado.
+    """
+
+    # realiza o download da imagem
+    resp = sess.get(produto['url'], stream=True)
+        
+    # verifica se o download foi concluido com sucesso
+    if resp.status_code == 200:
+        
+        # se não existe o diretório com o nome desse produto, cria um
+        if not os.path.exists(produto['path']):
+            os.makedirs(produto['path'])
+
+        # cria um arquivo novo e transfere todos os dados baixados nele
+        with open(produto['path'] + f"/{produto['img']}", 'wb') as saida:
+            shutil.copyfileobj(resp.raw, saida)
+
+        return produto
+
+    return NULL
 
 class SentinelUpscaling:
+    """ 
+    Classe principal do plugin, sendo considerado o main do projeto
+
+    Attributes
+    ----------
+    iface: QProject
+        É a interface do QGIS com o codigo python.
+    setgns: QSettings
+        É responsável pela configuração do plugin.
+    plugin_dir: str
+        Contem o caminho completo do diretório.
+    translator: QTranslator
+        Variável do QGIS, utilizada implicitamente.
+    actions: list
+        Lista das ações de interação com o plugin.
+    menu: QCoreApplication
+        Referencia ao menu de plugins do QGIS, utilizado automaticamente pelo Plugin Builder.
+    first_start: bool
+        É uma variavel para indicar a primeira utilização do plugin, quando o usuário invoca o plugin.
+    url_nome: dict
+        É uma variavel para guardar as informações dos produtos buscados.
+    lista_down: list
+        É uma variavel com todos os nomes dos produtos buscados.
+    dlg: SentinelUpscalingDialog
+        É uma referencia a UI importada do plugin, ela contem todos os widgets e conexões da interface para o login do usuário.
+    dlg_search: SentinelUpscalingDialogSearch
+        É uma referencia a UI importada do plugin, ela contem todos os widgets e conexões da interface para a busca de imagens.
+    """
 
     def __init__(self, iface):
+        """ 
+        Construtor da Classe,  sendo criada automaticamente pelo Plugin Builder.
+
+        Parameters
+        ----------
+        iface: QProject
+            É uma variavel de referencia a interface do QGIS.
+
+        """
         
         self.iface = iface
         self.setgns = QSettings()
@@ -82,7 +299,19 @@ class SentinelUpscaling:
         self.first_start = None
 
     def tr(self, message):
+        """ 
+        Função criada automaticamente pelo Plugin Builder, cria uma referencia para a aplicação central do QGIS para o plugin
 
+        Parameters
+        ----------
+        message: str
+            É a messagem inicial do plugin.
+
+        Returns
+        -------
+        QCoreApplication
+            retorna o menu aonde o plugin foi inserido
+        """
         return QCoreApplication.translate('SentinelUpscaling', message)
 
 
@@ -97,6 +326,35 @@ class SentinelUpscaling:
         status_tip=None,
         whats_this=None,
         parent=None):
+        """ 
+        Adiciona ações ao atributo action do plugin, sendo criada automaticamente pelo Plugin Builder.
+
+        Parameters
+        ----------
+        icon_path: str
+            Caminho para o icone do plugin.
+        text: str
+            Texto com as informações da ação.
+        callback: function
+            Função inserida na conexão com a ação inserida
+        enabled_flag: bool
+            Variável criada pelo Plugin Builder, habilita ou não as flags da ação.
+        add_to_menu: bool
+            Variável criada pelo Plugin Builder, habilita ou não a adição da ação no menu.
+        add_to_toolbar: bool
+            Variável criada pelo Plugin Builder, habilita ou não a adição da ação no toolbar.
+        status_tip: str
+            Variável criada pelo Plugin Builder.
+        whats_this: str
+            Variável criada pelo Plugin Builder.
+        parent: QAction
+            Variável criada pelo Plugin Builder, sendo referencia ao parente dessa ação, se houver.
+
+        Returns
+        -------
+        Action
+            É a ação criada na função
+        """
         
         icon = QIcon(icon_path)
         action = QAction(icon, text, parent)
@@ -120,8 +378,11 @@ class SentinelUpscaling:
         self.actions.append(action)
 
         return action
-
+        
     def initGui(self):
+        """ 
+        Faz a chamada das funções para inicializar e adicionar o plugin no QGIS, sendo criada automaticamente pelo Plugin Builder. 
+        """
 
         icon_path = ':/plugins/sentinel_upscaling/icon.png'
         self.add_action(
@@ -134,6 +395,9 @@ class SentinelUpscaling:
 
 
     def unload(self):
+        """ 
+        É o Destrutor da classe. Remove todas as ações criadas na inicialização do plugin, sendo criada automaticamente pelo Plugin Builder.
+        """
 
         for action in self.actions:
             self.iface.removePluginMenu(
@@ -141,13 +405,27 @@ class SentinelUpscaling:
                 action)
             self.iface.removeToolBarIcon(action)
 
-
     def formaImage(self, bytes):
+        """ 
+        Cria a imagem a partir dos bytes dela e insere em um widget PixMap, para ser inserido na coluna da tabela.
 
+        Parameters
+        ----------
+        bytes: list(str)
+            Bytes da imagem preview baixada
+
+        Returns
+        -------
+        QLabel
+            É um widget com a imagem criada
+        """
+
+        # cria a label para conter a imagem
         labels = QLabel(self.dlg_search)
         labels.setText("")
         labels.setScaledContents(True)
 
+        # carrega os bytes e forma uma imagem
         pixmap = QPixmap()
         pixmap.loadFromData(bytes, "jpg")
         
@@ -155,79 +433,103 @@ class SentinelUpscaling:
         
         return labels
 
+    def busca_completa(self, exception, result=None):
+        """ 
+        Função chamada após realizar a busca e inserção dos produtos na tabela.
+
+        Parameters
+        ----------
+        exception: Exception
+            Variável da exceção ocorrida durante a função de busca, caso ocorreu
+        result: dict
+            Dicionário com todas as informações dos produtos buscados
+        """
+
+        # se a busca terminou com sucesso, vai ter um resultado
+        if result:
+
+            # atualiza a lista de arquivos e de nomes de produtos.
+            self.url_nome = result[0]
+            self.lista_down = result[1]
+            i = 0
+
+            # para cada preview do produto baixado, gera a imagem dele e insere na tabela.
+            for imgs in result[2]:
+                
+                item = self.formaImage(imgs)
+                self.dlg_search.tabela.setCellWidget(i, 1, item)
+                i = i + 1
+
     def busca(self):
+        """ 
+        Função para realizar a busca dos produtos a partir da data e porcentagem de nuvem que o usuário inseriu
+        """
 
+        # inicializa as listas
         self.lista_down = []
+        self.url_nome = []
 
-        footprint = geojson_to_wkt(read_geojson(os.path.dirname(__file__) + "/map.geojson"))
-
+        # chama a api para buscar os produtos a partir do dia, porcentagem de nuvem, area do poligono e da plataforma Sentinel 2.
         products = self.api.query(footprint,
                      date=(self.dlg_search.dataInicial.date().toString("yyyyMMdd"), self.dlg_search.dataFinal.date().toString("yyyyMMdd")),
                      platformname='Sentinel-2',
                      producttype='S2MSI2A',
-                     cloudcoverpercentage=(0, 100))
+                     cloudcoverpercentage=self.nuvens.value())
 
+        # limpa os conteudos da tabela
         self.iid = 0
         self.dlg_search.tabela.clearContents()
         self.dlg_search.tabela.setRowCount(0)
         self.dlg_search.tabela.setSelectionBehavior(QTableView.SelectRows)
 
-        for chave, valor in products.items():
-            self.dlg_search.tabela.insertRow(self.iid)
+        # cria a thread para realizar a inserção dos produtos
+        globals()['task1'] = QgsTask.fromFunction("Busca das Imagens", realiza_busca,
+                                        on_finished=self.busca_completa, produto=products, sess=self.sessao, tabela=self.dlg_search.tabela, flags=QgsTask.CanCancel)
 
-            description = f"Titulo: {valor['title']}\nData: {valor['beginposition']}\n% de Nuvens: {valor['cloudcoverpercentage']}\nTamanho do Arquivo: {valor['size']}"
-            
-            byts = self.sessao.get(valor["link_icon"]).content
-            img = self.formaImage(byts)
-            self.dlg_search.tabela.setColumnWidth(0,366)
-            self.dlg_search.tabela.setColumnWidth(1,70)
-            self.dlg_search.tabela.setItem(self.iid, 0, QTableWidgetItem(description))
-            self.dlg_search.tabela.setCellWidget(self.iid, 1, img)
-            self.lista_down.append(chave)
-
-            self.iid = self.iid + 1  
+        QgsApplication.taskManager().addTask(globals()['task1'])
 
     def download(self):
+        """ 
+        Função para realizar o download do produto escolhido pelo usuário.
+        """
+
 
         index = self.dlg_search.tabela.selectionModel().selectedRows()[0].row()
-        self.down_alvo = self.lista_down[index]
-    
-        globals()['task2'] = QgsTask.fromFunction("Download da Imagem " + self.img_down, do_task,
-                                 on_finished=self.completed, produto=self.down_alvo, api=self.api)
+        online_down_alvo = self.lista_down[index]
+        self.down_alvo = self.url_nome[index]
+        
+        is_online = self.api.is_online(online_down_alvo)
 
-        QgsApplication.taskManager().addTask(globals()['task2'])
+        if is_online:
+            if os.path.exists(self.down_alvo['path'] + f"/{self.down_alvo['img']}"):
+                QMessageBox.warning(self.dlg_search, "Imagem ja baixada", f"A imagem escolhida já está presente no seu diretorio, se o arquivo dela está incompleto, por favor exclua-o e realize novamente o download.\nDiretorio do arquivo: {self.down_alvo['path']}/{self.down_alvo['img']}")
+            else:
+                globals()['task2'] = QgsTask.fromFunction("Download da Imagem " + self.img_down, faz_download,
+                                        on_finished=self.completed, produto=self.down_alvo, sess=self.sessao, flags=QgsTask.CanCancel)
+
+                QgsApplication.taskManager().addTask(globals()['task2'])
+        else:
+            QMessageBox.warning(self.dlg_search, "Imagem não está Online", "A imagem escolhida não está online, portanto o download dela não foi possivel")
     
+    def finalizada(self, exception, result=None):
+        
+        self.iface.addRasterLayer(result[0][:-4] + "_up.jpeg", result[1])
+
+    def warp_reproject(self):
+        self.start = time.time()
+
+        globals()['warps'] = QgsTask.fromFunction("Aumento da Escala da Imagem " + self.img_down, faz_upscaling,
+                                        on_finished=self.finalizada, projeto=self.warps, flags=QgsTask.CanCancel)
+
+        QgsApplication.taskManager().addTask(globals()['warps'])
+
     def completed(self, exception, result=None):
+        
+        if result['img']:
 
-        if result:
-            base_img = []
-
-            target_dir = os.path.dirname(__file__) + '/temp/' + result['title']
-
-            with ZipFile(result['path']) as zip:
-                for zip_info in zip.infolist():
-                    if zip_info.filename.endswith("jp2") and verifica(zip_info.filename):              
-                        zip_info.filename = os.path.basename(zip_info.filename).replace("_10m.jp2", ".jp2")
-                        zip.extract(zip_info, target_dir)
-                        base_img.append(zip_info.filename)
-
-            if os.path.exists(result['path']):
-                os.remove(result['path'])
+            self.warps = [result['path'] + "/" + result['img'][:-4] + '_4m.tif', result['img'], result['path'] + "/" + result['img']]
             
-            for img in base_img:
-                if img.endswith("_TCI.jp2"):
-                    img_target = target_dir + "/" + img
-                    baseName = img[0:-8]
-                    out_target = target_dir + "/" + baseName + ".tif"
-
-            processing.run('gdal:warpreproject',
-                        {'INPUT':img_target,
-                        'RESAMPLING': 4,
-                        'TARGET_RESOLUTION': 2.5000,
-                        'MULTITHREADING': True,
-                        'OUTPUT':out_target})
-
-            self.iface.addRasterLayer(out_target, baseName)
+            self.warp_reproject()
         else:
             if exception is None:
                 QgsMessageLog.logMessage(
@@ -246,18 +548,38 @@ class SentinelUpscaling:
 
     def verifica_login(self):
         
-        self.api = SentinelAPI(self.dlg.username.text(), self.dlg.password.text(), 'https://scihub.copernicus.eu/dhus')
         try:
-            self.api.query()
+            self.api = SentinelAPI(self.dlg.username.text(), self.dlg.password.text(), 'https://scihub.copernicus.eu/dhus', timeout=60)
+            
+            self.api.query(footprint,
+                     date=('20210301', '20210401'),
+                     platformname='Sentinel-2',
+                     producttype='S2MSI2A',
+                     cloudcoverpercentage=(0, 100))
+
             self.setgns.setValue("armazem/login", self.dlg.username.text())
             self.setgns.setValue("armazem/password", self.dlg.password.text())
             self.dlg.close()
 
             self.sessao = requests.Session()
             self.sessao.auth = (self.setgns.value("armazem/login"),self.setgns.value("armazem/password"))
+            headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) '\
+                         'AppleWebKit/537.36 (KHTML, like Gecko) '\
+                         'Chrome/75.0.3770.80 Safari/537.36'}
+            self.sessao.headers.update(headers)
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dlg_search)
             self.dlg_search.show()
-        except:
+
+            self.dlg_search.dataInicial.setDate(self.dlg_search.dataFinal.date().addDays(-7))
+            self.nuvens = QLabeledRangeSlider(Qt.Horizontal)
+            self.nuvens.setRange(0,100)
+            self.nuvens.setValue((0,100))
+            self.nuvens.setStyleSheet(QSS)
+            self.nuvens.setEdgeLabelMode('')
+            self.dlg_search.slider.layout().addWidget(self.nuvens)
+        except Exception as e:
+            eb = sys.exc_info()[0]
+            print(str(e))
             QMessageBox.warning(self.dlg, "Erro na Autenticação", "Entre novamente com os dados")
 
     def muda_botao(self):
